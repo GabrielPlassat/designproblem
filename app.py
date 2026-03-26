@@ -1,0 +1,1154 @@
+"""
+Formulateur de Sous-Problème Stratégique – Transition Écologique
+Outil Streamlit + Claude API
+"""
+
+import streamlit as st
+import anthropic
+import json
+import io
+from datetime import datetime
+
+# ─── CONFIG PAGE ────────────────────────────────────────────────────────────────
+st.set_page_config(
+    page_title="Formulateur Stratégique – Transition Écologique",
+    page_icon="🌿",
+    layout="wide",
+    initial_sidebar_state="expanded"
+)
+
+# ─── STYLES ─────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+.phase-header {
+    background: linear-gradient(135deg, #1a7a4a, #2d9d6a);
+    padding: 20px 28px;
+    border-radius: 12px;
+    color: white;
+    margin-bottom: 24px;
+}
+.phase-header h2 { color: white; margin: 0 0 6px 0; }
+.phase-header p  { color: #d4f5e9; margin: 0; }
+.hmw-box {
+    background: linear-gradient(135deg, #0f4c75, #1b6ca8);
+    padding: 28px;
+    border-radius: 14px;
+    color: white;
+    text-align: center;
+    margin: 20px 0;
+}
+.hmw-box h3 { color: white; font-size: 1.4rem; margin: 0; line-height: 1.5; }
+.score-box {
+    border: 2px solid #e0e0e0;
+    border-radius: 10px;
+    padding: 16px;
+    text-align: center;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# ─── CONSTANTES ─────────────────────────────────────────────────────────────────
+PHASES = [
+    ("1", "Ancrage", "Comprendre et clarifier le problème général"),
+    ("2", "Décomposition", "Identifier les sous-problèmes candidats"),
+    ("3", "Ressources & Contraintes", "Décrire précisément vos moyens"),
+    ("4", "Test de Cohérence", "Évaluer la faisabilité du sous-problème"),
+    ("5", "Formulation Finale", "Formuler, exporter et agir"),
+]
+
+CYNEFIN_INFO = {
+    "Clair":      ("🟢", "Relations cause-effet connues. Appliquer les meilleures pratiques."),
+    "Compliqué":  ("🟡", "Plusieurs bonnes réponses. Requiert expertise et analyse."),
+    "Complexe":   ("🟠", "Imprévisible. Expérimenter, observer, adapter."),
+    "Pernicieux": ("🔴", "Pas de solution définitive. Problème social profond (Wicked Problem)."),
+}
+
+# ─── SESSION STATE ───────────────────────────────────────────────────────────────
+DEFAULTS = {
+    "phase": 0,
+    "api_key": "",
+    "doc_text": "",
+    "sofia_data": None,
+    "problem_input": "",
+    "reformulation": "",
+    "cynefin": "",
+    "ambiguites": [],
+    "manques": [],
+    "sub_problems": [],
+    "selected_sub_problem": "",
+    "resources": {},
+    "constraints": {},
+    "coherence_score": None,
+    "coherence_details": {},
+    "hmw": "",
+    "final_data": {},
+}
+for k, v in DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ─── HELPERS ────────────────────────────────────────────────────────────────────
+
+def parse_sofia_html(html_content: str) -> dict:
+    """
+    Parse un rapport HTML exporté par SofIA (sofia-transition-ecologique.fr).
+    Retourne un dict structuré avec questions, reformulations, réponses et sources ADEME.
+    """
+    from html.parser import HTMLParser
+    import re
+
+    # Utilise BeautifulSoup si disponible, sinon regex fallback
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Date de la conversation
+        h1 = soup.find("h1")
+        date_conv = h1.get_text(strip=True) if h1 else ""
+
+        exchanges = []
+
+        # Questions
+        questions = soup.find_all("div", class_="question")
+        reformulations = soup.find_all("div", class_="reformulation")
+        responses = soup.find_all("div", class_="response")
+        sources_blocks = soup.find_all("div", class_="sources")
+
+        for i, (q, resp) in enumerate(zip(questions, responses)):
+            # Question brute
+            q_text = q.get_text(separator=" ", strip=True)
+            q_text = re.sub(r"^\d+\.\s*Question\s*:", "", q_text).strip()
+
+            # Reformulation SofIA
+            ref_text = ""
+            if i < len(reformulations):
+                ref_text = reformulations[i].get_text(separator=" ", strip=True)
+                ref_text = re.sub(r"Reformulation de la question\s*:", "", ref_text).strip()
+
+            # Réponse SofIA (texte enrichi)
+            # On garde le texte principal, on supprime les balises h2 "Sofia:"
+            for tag in resp.find_all("h2"):
+                tag.decompose()
+            resp_text = resp.get_text(separator="\n", strip=True)
+            # Nettoyage des artefacts HTML
+            resp_text = re.sub(r"\n{3,}", "\n\n", resp_text)
+
+            # Sources ADEME associées
+            sources = []
+            if i < len(sources_blocks):
+                cards = sources_blocks[i].find_all("div", class_="source-card")
+                for card in cards:
+                    card_id = card.get("id", "")
+                    title_tag = card.find("h2", class_="card-title")
+                    title = title_tag.get_text(strip=True) if title_tag else ""
+                    # Lien PDF
+                    link_tag = card.find("a", href=True)
+                    link = link_tag["href"] if link_tag else ""
+                    # Texte extrait
+                    text_tag = card.find("p", class_="card-text")
+                    excerpt = text_tag.get_text(separator=" ", strip=True) if text_tag else ""
+                    # Score de pertinence
+                    score_tag = card.find("p", class_="card-similarity")
+                    score_str = score_tag.get_text(strip=True) if score_tag else ""
+                    score_val = re.search(r"([\d.]+)\s*%", score_str)
+                    score_pct = float(score_val.group(1)) if score_val else 0.0
+
+                    sources.append({
+                        "id": card_id,
+                        "titre": title,
+                        "lien": link,
+                        "extrait": excerpt[:400],
+                        "score_pertinence": score_pct,
+                    })
+                # Tri par score décroissant
+                sources.sort(key=lambda x: x["score_pertinence"], reverse=True)
+
+            exchanges.append({
+                "question": q_text,
+                "reformulation_sofia": ref_text,
+                "reponse_sofia": resp_text[:3000],  # Cap pour éviter token overflow
+                "nb_sources": len(sources),
+                "sources_top5": sources[:5],
+            })
+
+        return {
+            "is_sofia": True,
+            "date": date_conv,
+            "nb_echanges": len(exchanges),
+            "exchanges": exchanges,
+        }
+
+    except ImportError:
+        # Fallback regex si BeautifulSoup absent
+        import re
+        questions = re.findall(r'class="question"[^>]*>(.*?)</div>', html_content, re.DOTALL)
+        responses = re.findall(r'class="response"[^>]*>(.*?)</div>', html_content, re.DOTALL)
+        clean = lambda s: re.sub(r"<[^>]+>", " ", s).strip()
+        exchanges = [
+            {"question": clean(q), "reponse_sofia": clean(r)[:2000], "sources_top5": []}
+            for q, r in zip(questions, responses)
+        ]
+        return {"is_sofia": True, "date": "", "nb_echanges": len(exchanges), "exchanges": exchanges}
+
+
+def sofia_to_context(sofia_data: dict) -> str:
+    """Convertit les données SofIA en bloc de contexte structuré pour Claude."""
+    lines = [
+        f"=== RAPPORT SOFIA — Transition Écologique ===",
+        f"Date : {sofia_data.get('date', '')}",
+        f"Nombre d'échanges : {sofia_data.get('nb_echanges', 0)}",
+        "",
+    ]
+    for i, ex in enumerate(sofia_data.get("exchanges", []), 1):
+        lines.append(f"── Échange {i} ──")
+        lines.append(f"QUESTION : {ex.get('question', '')}")
+        if ex.get("reformulation_sofia"):
+            lines.append(f"REFORMULATION SOFIA : {ex.get('reformulation_sofia', '')}")
+        lines.append(f"RÉPONSE SOFIA (synthèse ADEME) :\n{ex.get('reponse_sofia', '')}")
+        top_sources = ex.get("sources_top5", [])
+        if top_sources:
+            lines.append(f"\nSOURCES ADEME LES PLUS PERTINENTES ({len(top_sources)}) :")
+            for s in top_sources:
+                lines.append(
+                    f"  • [{s.get('score_pertinence', 0):.1f}%] {s.get('titre', '')} — {s.get('extrait', '')[:200]}"
+                )
+        lines.append("")
+    return "\n".join(lines)
+
+
+def extract_text(uploaded_file) -> str:
+    """Extrait le texte d'un fichier PDF, DOCX, TXT ou HTML SofIA."""
+    ext = uploaded_file.name.rsplit(".", 1)[-1].lower()
+    raw_bytes = uploaded_file.read()
+    try:
+        if ext == "txt":
+            return raw_bytes.decode("utf-8", errors="ignore")
+        elif ext == "pdf":
+            import pypdf
+            reader = pypdf.PdfReader(io.BytesIO(raw_bytes))
+            return "\n".join(p.extract_text() or "" for p in reader.pages)
+        elif ext in ("docx", "doc"):
+            from docx import Document
+            doc = Document(io.BytesIO(raw_bytes))
+            return "\n".join(p.text for p in doc.paragraphs)
+        elif ext in ("html", "htm"):
+            html_str = raw_bytes.decode("utf-8", errors="ignore")
+            # Détecte si c'est un rapport SofIA
+            if "sofia" in html_str.lower()[:2000] or "class=\"question\"" in html_str or "card-similarity" in html_str:
+                sofia_data = parse_sofia_html(html_str)
+                # Stocke aussi les données structurées pour affichage
+                st.session_state["sofia_data"] = sofia_data
+                return sofia_to_context(sofia_data)
+            else:
+                # HTML générique : strip balises
+                import re
+                return re.sub(r"<[^>]+>", " ", html_str)
+    except Exception as e:
+        st.error(f"Erreur lecture {uploaded_file.name} : {e}")
+    return ""
+
+
+def claude(prompt: str, system: str = None, max_tokens: int = 2000) -> str | None:
+    """Appel Claude API avec gestion d'erreur."""
+    if not st.session_state.api_key:
+        st.error("⚠️ Clé API manquante dans la barre latérale.")
+        return None
+    sys = system or (
+        "Tu es un consultant senior spécialisé en transition écologique et formulation "
+        "de problèmes stratégiques. Tu réponds en français, avec précision et pédagogie."
+    )
+    try:
+        client = anthropic.Anthropic(api_key=st.session_state.api_key)
+        msg = client.messages.create(
+            model="claude-opus-4-5",
+            max_tokens=max_tokens,
+            system=sys,
+            messages=[{"role": "user", "content": prompt}],
+        )
+        return msg.content[0].text
+    except Exception as e:
+        st.error(f"Erreur API : {e}")
+        return None
+
+
+def parse_json(raw: str) -> dict | list | None:
+    """Parse JSON en nettoyant les éventuels blocs markdown."""
+    if not raw:
+        return None
+    clean = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+    try:
+        return json.loads(clean)
+    except Exception as e:
+        st.error(f"Erreur de parsing JSON : {e}\n\nRéponse brute : {raw[:300]}")
+        return None
+
+
+def score_emoji(s: int, max_s: int = 100) -> str:
+    pct = s / max_s * 100
+    return "🟢" if pct >= 70 else "🟡" if pct >= 40 else "🔴"
+
+
+def next_phase():
+    st.session_state.phase += 1
+    st.rerun()
+
+
+def go_phase(n: int):
+    st.session_state.phase = n
+    st.rerun()
+
+
+# ─── SIDEBAR ────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.markdown("## 🌿 Formulateur Stratégique")
+    st.caption("Transition Écologique — Outil de cadrage")
+    st.divider()
+
+    key_input = st.text_input(
+        "🔑 Clé API Anthropic",
+        value=st.session_state.api_key,
+        type="password",
+        help="Commence par sk-ant-..."
+    )
+    if key_input != st.session_state.api_key:
+        st.session_state.api_key = key_input
+
+    st.divider()
+    st.markdown("### 📍 Progression")
+    for i, (num, name, _) in enumerate(PHASES):
+        if i < st.session_state.phase:
+            st.markdown(f"✅ **Phase {num}** – {name}")
+        elif i == st.session_state.phase:
+            st.markdown(f"▶️ **Phase {num} – {name}** ← ici")
+        else:
+            st.markdown(f"⬜ Phase {num} – {name}")
+
+    st.divider()
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("◀ Retour", disabled=st.session_state.phase == 0, use_container_width=True):
+            st.session_state.phase -= 1
+            st.rerun()
+    with col2:
+        if st.button("🔄 Reset", use_container_width=True):
+            api = st.session_state.api_key
+            for k in list(st.session_state.keys()):
+                del st.session_state[k]
+            for k, v in DEFAULTS.items():
+                st.session_state[k] = v
+            st.session_state.api_key = api
+            st.rerun()
+
+    st.divider()
+    st.caption("Basé sur : Cynefin (Snowden), Problem Statement Canvas, JTBD, Double Diamant, HMW (IDEO), Frame Innovation (Dorst)")
+
+
+# ─── PHASE HEADER HELPER ────────────────────────────────────────────────────────
+def phase_header(num, name, desc):
+    st.markdown(f"""
+<div class="phase-header">
+  <h2>Phase {num} — {name}</h2>
+  <p>{desc}</p>
+</div>
+""", unsafe_allow_html=True)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 0 — ANCRAGE
+# ════════════════════════════════════════════════════════════════════════════════
+if st.session_state.phase == 0:
+    phase_header("1", "Ancrage", "Décrire et clarifier votre problème général. Briser l'illusion de clarté.")
+
+    st.markdown("""
+> *"Tomber amoureux du problème, pas de la solution."* — Marty Cagan
+>
+> Beaucoup d'experts pensent avoir un problème clair. Ce qu'ils ont, c'est souvent **une intention**.
+> Cette phase va révéler les zones d'ombre avant d'aller plus loin.
+""")
+
+    # ── Upload documents ──
+    st.subheader("📎 Documents de contexte")
+
+    col_tip1, col_tip2 = st.columns(2)
+    with col_tip1:
+        st.info(
+            "**💡 Rapport SofIA recommandé**\n\n"
+            "Consultez d'abord [SofIA](https://www.sofia-transition-ecologique.fr) "
+            "(IA de l'ADEME) pour interroger la base documentaire sur votre thématique, "
+            "puis exportez l'historique en HTML et uploadez-le ici.\n\n"
+            "L'outil reconnaît automatiquement ce format et extrait questions, "
+            "réponses et sources ADEME."
+        )
+    with col_tip2:
+        st.markdown(
+            "**Autres formats acceptés :**\n"
+            "- 📄 PDF (rapports, études)\n"
+            "- 📝 DOCX (cahiers des charges)\n"
+            "- 🌐 HTML (rapport SofIA exporté)\n"
+            "- 📋 TXT (notes, synthèses)\n"
+        )
+
+    files = st.file_uploader(
+        "Glissez vos documents ici",
+        accept_multiple_files=True,
+        type=["pdf", "docx", "txt", "html", "htm"],
+        label_visibility="collapsed"
+    )
+    if files:
+        texts = []
+        sofia_detected = False
+        for f in files:
+            t = extract_text(f)
+            if t:
+                texts.append(f"=== {f.name} ===\n{t}")
+            if st.session_state.get("sofia_data"):
+                sofia_detected = True
+
+        st.session_state.doc_text = "\n\n".join(texts)
+        nb_chars = len(st.session_state.doc_text)
+
+        if sofia_detected and st.session_state.sofia_data:
+            sd = st.session_state.sofia_data
+            st.success(f"✅ Rapport SofIA détecté — {sd['nb_echanges']} échange(s) analysé(s)")
+            st.markdown(f"**{sd.get('date', '')}**")
+
+            for i, ex in enumerate(sd.get("exchanges", []), 1):
+                with st.expander(f"💬 Échange {i} : {ex.get('question', '')[:80]}…"):
+                    st.markdown(f"**Question :** {ex.get('question', '')}")
+                    if ex.get("reformulation_sofia"):
+                        st.markdown(f"**Reformulation SofIA :** *{ex.get('reformulation_sofia', '')}*")
+                    st.markdown("**Réponse SofIA (extrait) :**")
+                    st.markdown(ex.get("reponse_sofia", "")[:1500] + "…")
+
+                    top_src = ex.get("sources_top5", [])
+                    if top_src:
+                        st.markdown(f"**📚 {ex.get('nb_sources', len(top_src))} sources ADEME — Top 5 :**")
+                        for s in top_src:
+                            score_color = "🟢" if s["score_pertinence"] > 10 else "🟡" if s["score_pertinence"] > 5 else "🔴"
+                            lien_md = f"[↗]({s['lien']})" if s.get("lien") else ""
+                            st.markdown(
+                                f"  {score_color} **{s['score_pertinence']:.1f}%** — {s.get('titre', '')} {lien_md}"
+                            )
+        else:
+            st.success(f"✅ {len(files)} document(s) chargé(s) — {nb_chars:,} caractères extraits")
+            with st.expander("Aperçu du texte extrait"):
+                st.text(st.session_state.doc_text[:3000] + ("…" if nb_chars > 3000 else ""))
+
+    st.divider()
+
+    # ── Saisie libre ──
+    st.subheader("✍️ Décrivez votre problème général")
+    st.caption("Exprimez-vous librement. Ne pensez pas encore à la solution ni aux ressources.")
+    problem_input = st.text_area(
+        "Problème général",
+        value=st.session_state.problem_input,
+        height=160,
+        placeholder=(
+            "Ex : Les émissions de GES liées à la logistique urbaine continuent d'augmenter "
+            "malgré les réglementations. Les opérateurs peinent à adapter leurs flottes. "
+            "Les collectivités manquent de données pour agir efficacement..."
+        ),
+        label_visibility="collapsed"
+    )
+    st.session_state.problem_input = problem_input
+
+    can_analyze = bool(problem_input.strip()) and bool(st.session_state.api_key)
+
+    if not st.session_state.api_key:
+        st.warning("⚠️ Renseignez votre clé API Anthropic dans la barre latérale.")
+
+    if st.button("🔍 Analyser mon problème", type="primary", disabled=not can_analyze):
+        # Contexte : priorité au rapport SofIA (données ADEME structurées)
+        context_block = ""
+        if st.session_state.get("sofia_data"):
+            sd = st.session_state.sofia_data
+            sofia_lines = [
+                "CONTEXTE ISSU DE SOFIA (base documentaire ADEME — source de référence) :",
+                f"Date de consultation : {sd.get('date', '')}",
+                "",
+            ]
+            for i, ex in enumerate(sd.get("exchanges", []), 1):
+                sofia_lines.append(f"Q{i} posée par l'expert : {ex.get('question', '')}")
+                sofia_lines.append(f"Synthèse ADEME : {ex.get('reponse_sofia', '')[:800]}")
+                top5 = ex.get("sources_top5", [])
+                if top5:
+                    sofia_lines.append("Sources ADEME mobilisées : " +
+                        " | ".join(f"{s['titre'][:50]} ({s['score_pertinence']:.0f}%)" for s in top5[:3]))
+                sofia_lines.append("")
+            context_block = "\n".join(sofia_lines)[:5000] + "\n\n"
+        elif st.session_state.doc_text:
+            context_block = f"DOCUMENTS FOURNIS :\n{st.session_state.doc_text[:4000]}\n\n"
+
+        sofia_instruction = ""
+        if st.session_state.get("sofia_data"):
+            sofia_instruction = (
+                "\nATTENTION : Le contexte provient de SofIA (IA de l'ADEME). "
+                "Utilise les données chiffrées, objectifs réglementaires et retours d'expérience "
+                "identifiés dans les échanges SofIA pour enrichir ton analyse et tes recommandations. "
+                "Cite les données concrètes issues des sources ADEME pour justifier ta classification Cynefin."
+            )
+
+        prompt = f"""{context_block}L'expert décrit son problème général :
+"{problem_input}"{sofia_instruction}
+
+Réalise une analyse structurée. Réponds UNIQUEMENT en JSON valide (pas de markdown, pas de backticks) avec ces clés :
+- "reformulation" : reformulation précise en 2-3 phrases, fidèle à l'expert mais sans ambiguïté. Si des données SofIA/ADEME sont disponibles, intègre les éléments factuels clés (objectifs, chiffres, contexte réglementaire).
+- "cynefin" : objet avec "categorie" (Clair|Compliqué|Complexe|Pernicieux) et "justification" (1-2 phrases, appuyée sur les données disponibles)
+- "ambiguites" : liste de 3-5 formulations ambiguës ou zones d'ombre dans l'énoncé
+- "manques" : liste de 3-4 informations clés absentes qui empêchent de bien cerner le problème (ne pas signaler ce qui est déjà fourni par SofIA)
+"""
+        with st.spinner("Analyse en cours…"):
+            raw = claude(prompt)
+        data = parse_json(raw)
+        if data:
+            st.session_state.reformulation = data.get("reformulation", "")
+            st.session_state.cynefin = data.get("cynefin", {})
+            st.session_state.ambiguites = data.get("ambiguites", [])
+            st.session_state.manques = data.get("manques", [])
+
+    # ── Résultats ──
+    if st.session_state.reformulation:
+        st.divider()
+        st.subheader("📊 Analyse de votre problème")
+
+        col_a, col_b = st.columns([3, 1])
+        with col_a:
+            st.markdown("**🔄 Reformulation proposée**")
+            st.info(st.session_state.reformulation)
+
+            if st.session_state.ambiguites:
+                st.markdown("**⚠️ Ambiguïtés détectées**")
+                for a in st.session_state.ambiguites:
+                    st.warning(f"• {a}")
+
+            if st.session_state.manques:
+                st.markdown("**❓ Informations manquantes**")
+                for m in st.session_state.manques:
+                    st.error(f"• {m}")
+
+        with col_b:
+            st.markdown("**🧭 Nature du problème**")
+            cyn = st.session_state.cynefin
+            if isinstance(cyn, dict):
+                cat = cyn.get("categorie", "Complexe")
+                justif = cyn.get("justification", "")
+            else:
+                cat, justif = str(cyn), ""
+            emoji, desc = CYNEFIN_INFO.get(cat, ("📌", cat))
+            st.markdown(f"### {emoji} {cat}")
+            st.caption(desc)
+            if justif:
+                st.caption(f"*{justif}*")
+
+        st.markdown("**✏️ Ajustez la reformulation si nécessaire**")
+        edited = st.text_area("Reformulation", value=st.session_state.reformulation, height=100,
+                               label_visibility="collapsed")
+        st.session_state.reformulation = edited
+
+        st.button("✅ Valider et passer à la Décomposition →", type="primary", on_click=next_phase)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 1 — DÉCOMPOSITION
+# ════════════════════════════════════════════════════════════════════════════════
+elif st.session_state.phase == 1:
+    phase_header("2", "Décomposition", "Explorer les sous-problèmes possibles et choisir votre cible.")
+
+    st.info(f"**Problème général** : {st.session_state.reformulation}")
+    st.markdown("""
+> Un problème général peut se décomposer de dizaines de façons selon l'acteur ciblé,
+> le levier utilisé et l'horizon temporel. Cette phase vous oblige à **faire un choix**
+> plutôt que de tout vouloir résoudre.
+""")
+
+    if st.button("🤖 Générer des sous-problèmes candidats", type="primary",
+                 disabled=not st.session_state.api_key):
+
+        # Enrichit avec données SofIA si disponibles
+        sofia_context = ""
+        if st.session_state.get("sofia_data"):
+            sd = st.session_state.sofia_data
+            facts = []
+            for ex in sd.get("exchanges", []):
+                # Extrait les 500 premiers caractères de chaque réponse (données chiffrées)
+                facts.append(ex.get("reponse_sofia", "")[:500])
+            sofia_context = (
+                "\n\nDONNÉES ADEME (issues de SofIA) pour contextualiser les sous-problèmes :\n"
+                + "\n---\n".join(facts[:3])
+                + "\n\nUtilise ces données pour que les sous-problèmes s'appuient sur des "
+                  "objectifs réglementaires réels, des chiffres ADEME vérifiés et des "
+                  "retours d'expérience documentés.\n"
+            )
+
+        prompt = f"""Problème général (transition écologique) :
+"{st.session_state.reformulation}"{sofia_context}
+
+Génère 6 sous-problèmes candidats distincts. Varie les angles :
+- Acteur ciblé (entreprise, collectivité, citoyen, filière sectorielle...)
+- Levier principal (technique, comportemental, réglementaire, économique, formation, data...)
+- Temporalité (court terme <18 mois vs moyen terme 18-36 mois)
+
+Pour chaque sous-problème, fournis :
+- "id" : numéro de 1 à 6
+- "titre" : titre court accrocheur (max 10 mots)
+- "description" : 2 phrases précises expliquant le sous-problème. Si pertinent, cite un objectif chiffré ou une réglementation existante.
+- "acteur" : acteur principal ciblé
+- "levier" : type de levier principal (1 mot)
+- "temporalite" : "court" (<18 mois) ou "moyen" (18-36 mois)
+- "ambition" : "locale", "sectorielle" ou "systémique"
+- "pourquoi_pertinent" : 1 phrase expliquant pourquoi ce sous-problème est pertinent, avec référence à des données concrètes si disponibles
+- "ancrage_ademe" : "oui" si ce sous-problème est directement ancré dans des objectifs/données ADEME connus, "non" sinon
+
+Réponds UNIQUEMENT en JSON valide avec une clé "sous_problemes" contenant la liste.
+"""
+        with st.spinner("Génération des sous-problèmes…"):
+            raw = claude(prompt, max_tokens=2500)
+        data = parse_json(raw)
+        if data:
+            st.session_state.sub_problems = data.get("sous_problemes", [])
+
+    if st.session_state.sub_problems:
+        st.divider()
+        st.subheader("🗂️ Sous-problèmes candidats")
+        st.caption("Cliquez sur 'Sélectionner' pour retenir un sous-problème, ou formulez le vôtre ci-dessous.")
+
+        levier_emojis = {
+            "technique": "⚙️", "comportemental": "🧠", "réglementaire": "📋",
+            "économique": "💰", "formation": "🎓", "data": "📊", "organisationnel": "🏗️"
+        }
+
+        for sp in st.session_state.sub_problems:
+            le = levier_emojis.get(sp.get("levier", "").lower(), "📌")
+            te = "⏱️" if sp.get("temporalite") == "court" else "📅"
+            ae = {"locale": "📍", "sectorielle": "🏭", "systémique": "🌍"}.get(sp.get("ambition", ""), "")
+
+            with st.container():
+                c1, c2 = st.columns([5, 1])
+                with c1:
+                    ademe_badge = " 🏛️ *ancré ADEME*" if sp.get("ancrage_ademe") == "oui" else ""
+                    st.markdown(f"""
+**{sp.get('id', '')}. {sp.get('titre', '')}** {le} {te} {ae}{ademe_badge}
+
+{sp.get('description', '')}
+
+`Acteur : {sp.get('acteur', '')}` &nbsp;|&nbsp; `Levier : {sp.get('levier', '')}` &nbsp;|&nbsp; `{sp.get('ambition', '')}` &nbsp;|&nbsp; `{sp.get('temporalite', '')} terme`
+
+*{sp.get('pourquoi_pertinent', '')}*
+""")
+                with c2:
+                    if st.button("Sélectionner", key=f"sel_{sp.get('id')}",
+                                 use_container_width=True):
+                        st.session_state.selected_sub_problem = (
+                            f"{sp.get('titre', '')} : {sp.get('description', '')}"
+                        )
+                        st.rerun()
+                st.divider()
+
+    # Formulation personnalisée
+    st.subheader("✍️ Formulez ou ajustez votre sous-problème")
+    custom = st.text_area(
+        "Votre sous-problème",
+        value=st.session_state.selected_sub_problem,
+        height=120,
+        placeholder="Décrivez précisément le sous-problème que vous souhaitez résoudre...",
+        label_visibility="collapsed"
+    )
+    st.session_state.selected_sub_problem = custom
+
+    if st.session_state.selected_sub_problem.strip():
+        st.success(f"**Sous-problème retenu** : {st.session_state.selected_sub_problem}")
+        st.button("✅ Valider et décrire mes ressources →", type="primary", on_click=next_phase)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 2 — RESSOURCES & CONTRAINTES
+# ════════════════════════════════════════════════════════════════════════════════
+elif st.session_state.phase == 2:
+    phase_header("3", "Ressources & Contraintes", "Plus vous êtes précis ici, plus le test de cohérence sera utile.")
+
+    st.info(f"**Sous-problème** : {st.session_state.selected_sub_problem}")
+
+    st.markdown("""
+> C'est souvent ici que les projets déraillent : les objectifs sont calibrés sur l'ambition,
+> pas sur les moyens réels. Soyez honnête — cet outil ne juge pas, il vous aide.
+""")
+
+    r = st.session_state.resources
+    c = st.session_state.constraints
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.subheader("💰 Budget")
+        budget_total      = st.number_input("Budget total (€)", min_value=0, step=10_000,
+                                             value=int(r.get("budget", 0)))
+        budget_rh         = st.number_input("Dont masse salariale / RH (€)", min_value=0, step=5_000,
+                                             value=int(r.get("budget_rh", 0)))
+        budget_prestation = st.number_input("Dont prestations externes (€)", min_value=0, step=5_000,
+                                             value=int(r.get("budget_prestation", 0)))
+
+        st.subheader("👥 Équipe")
+        etp = st.number_input("ETP dédiés au projet", min_value=0.0, step=0.5,
+                               value=float(r.get("etp", 0.5)))
+        competences = st.multiselect(
+            "Compétences disponibles en interne",
+            ["Ingénierie / technique", "Data / IA", "Sciences comportementales",
+             "Communication / sensibilisation", "Droit / réglementation",
+             "Finance / économie", "Sciences naturelles / écologie",
+             "Management de projet", "Concertation / participation citoyenne"],
+            default=r.get("competences", [])
+        )
+        competences_manquantes = st.text_area(
+            "Compétences manquantes (à recruter ou sous-traiter)",
+            value=r.get("competences_manquantes", ""),
+            height=80,
+            placeholder="Ex: expertise juridique en droit environnemental, data scientist..."
+        )
+
+    with col2:
+        st.subheader("⏱️ Contraintes temporelles")
+        duree_mois = st.slider("Durée totale du projet (mois)", 6, 60,
+                               value=int(c.get("duree_mois", 36)))
+        jalon_mois = st.slider("Premier jalon / résultats intermédiaires attendus (mois)", 3, 36,
+                               value=int(c.get("jalon_mois", 18)))
+
+        st.subheader("🎯 Objectifs attendus")
+        objectif_principal = st.text_area(
+            "Objectif principal (chiffré si possible)",
+            value=c.get("objectif_principal", ""),
+            height=80,
+            placeholder="Ex: Réduire de 20% les émissions GES du secteur X sur le territoire Y d'ici 2027"
+        )
+        objectif_secondaire = st.text_area(
+            "Objectifs secondaires",
+            value=c.get("objectif_secondaire", ""),
+            height=60,
+            placeholder="Ex: Former 50 entreprises, créer un outil de mesure réplicable..."
+        )
+
+        st.subheader("🤝 Partenaires & Historique")
+        partenaires_imposes = st.text_area(
+            "Partenaires obligatoires (imposés par le financement ou la gouvernance)",
+            value=c.get("partenaires_imposes", ""),
+            height=60,
+            placeholder="Ex: ADEME, Région X, Fédération professionnelle Y..."
+        )
+        partenaires_potentiels = st.text_area(
+            "Partenaires potentiels (à mobiliser)",
+            value=c.get("partenaires_potentiels", ""),
+            height=60
+        )
+        deja_tente = st.text_area(
+            "Ce qui a déjà été tenté sur ce problème (et pourquoi ça n'a pas suffi)",
+            value=c.get("deja_tente", ""),
+            height=80,
+            placeholder="Ex: Campagne de sensibilisation en 2021 → faible adoption car pas de levier économique associé..."
+        )
+
+    st.divider()
+
+    if st.button("✅ Valider et tester la cohérence →", type="primary"):
+        st.session_state.resources = {
+            "budget": budget_total, "budget_rh": budget_rh,
+            "budget_prestation": budget_prestation, "etp": etp,
+            "competences": competences, "competences_manquantes": competences_manquantes,
+        }
+        st.session_state.constraints = {
+            "duree_mois": duree_mois, "jalon_mois": jalon_mois,
+            "objectif_principal": objectif_principal, "objectif_secondaire": objectif_secondaire,
+            "partenaires_imposes": partenaires_imposes, "partenaires_potentiels": partenaires_potentiels,
+            "deja_tente": deja_tente,
+        }
+        next_phase()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 3 — TEST DE COHÉRENCE
+# ════════════════════════════════════════════════════════════════════════════════
+elif st.session_state.phase == 3:
+    phase_header("4", "Test de Cohérence", "Votre sous-problème est-il réellement à votre portée ?")
+
+    r = st.session_state.resources
+    c = st.session_state.constraints
+
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("💰 Budget total", f"{r.get('budget', 0):,.0f} €")
+    col2.metric("👥 ETP", f"{r.get('etp', 0)}")
+    col3.metric("📅 Durée", f"{c.get('duree_mois', 0)} mois")
+    col4.metric("⏱️ 1er jalon", f"{c.get('jalon_mois', 0)} mois")
+
+    st.info(f"**Sous-problème évalué** : {st.session_state.selected_sub_problem}")
+
+    if st.button("🔬 Lancer le test de cohérence", type="primary",
+                 disabled=not st.session_state.api_key):
+        prompt = f"""Tu évalues la cohérence entre un sous-problème de transition écologique et les ressources disponibles.
+
+SOUS-PROBLÈME : {st.session_state.selected_sub_problem}
+PROBLÈME GÉNÉRAL : {st.session_state.reformulation}
+
+RESSOURCES :
+- Budget total : {r.get('budget', 0):,}€ (RH : {r.get('budget_rh', 0):,}€ | Prestations : {r.get('budget_prestation', 0):,}€)
+- ETP : {r.get('etp', 0)}
+- Compétences internes : {', '.join(r.get('competences', [])) or 'Non précisé'}
+- Compétences manquantes : {r.get('competences_manquantes', 'Non précisé')}
+
+CONTRAINTES :
+- Durée totale : {c.get('duree_mois', 0)} mois
+- Premier jalon : {c.get('jalon_mois', 0)} mois
+- Objectif principal : {c.get('objectif_principal', 'Non précisé')}
+- Partenaires obligatoires : {c.get('partenaires_imposes', 'Aucun')}
+- Déjà tenté : {c.get('deja_tente', 'Rien de connu')}
+
+Évalue selon 4 critères, chacun noté de 0 à 25 :
+
+1. "mesurabilite" — Les objectifs sont-ils mesurables avec ces moyens ? Des KPIs clairs sont-ils définissables ?
+2. "jalons" — Un résultat concret est-il réaliste dans le délai du premier jalon (apprentissage, prototype, données) ?
+3. "competences" — Les compétences disponibles couvrent-elles les leviers nécessaires ? Les manques sont-ils gérables ?
+4. "precedents" — Existe-t-il dans la bibliographie ou la pratique des projets comparables à ce niveau de ressources ?
+
+Pour chaque critère :
+- "score" : 0 à 25
+- "commentaire" : 2-3 phrases d'analyse honnête
+- "recommandation" : 1 action corrective concrète si score < 15 (sinon null)
+
+Ajoute aussi :
+- "score_global" : somme des 4 scores (0-100)
+- "verdict" : "Cohérent" (70-100) | "Ajustements nécessaires" (40-69) | "Recadrage fort recommandé" (0-39)
+- "analyse_risques" : 2-3 phrases sur les principaux risques de ce sous-problème avec ces ressources
+- "recadrage_suggere" : Si verdict ≠ "Cohérent", propose un sous-problème plus ajusté (sinon null)
+
+Réponds UNIQUEMENT en JSON valide. Aucun markdown, aucun backtick.
+"""
+        with st.spinner("Analyse de cohérence en cours…"):
+            raw = claude(prompt, system=(
+                "Tu es un expert rigoureux en évaluation de projets de transition écologique. "
+                "Tu donnes des verdicts honnêtes et constructifs. Tu réponds en JSON valide uniquement."
+            ), max_tokens=2500)
+        data = parse_json(raw)
+        if data:
+            st.session_state.coherence_score = data.get("score_global", 0)
+            st.session_state.coherence_details = data
+
+    # ── Résultats ──
+    if st.session_state.coherence_score is not None:
+        d = st.session_state.coherence_details
+        score = st.session_state.coherence_score
+        verdict = d.get("verdict", "")
+        emoji = score_emoji(score)
+
+        st.divider()
+
+        # Score global centré
+        _, mid, _ = st.columns([1, 2, 1])
+        with mid:
+            st.markdown(f"""
+<div class="score-box">
+  <h1 style="font-size:3rem; margin:0">{emoji} {score}<span style="font-size:1.5rem">/100</span></h1>
+  <h3 style="margin:8px 0 0 0">Verdict : {verdict}</h3>
+</div>
+""", unsafe_allow_html=True)
+
+        st.divider()
+
+        # Détail par critère
+        st.subheader("📊 Détail par critère")
+        criteres = [
+            ("mesurabilite",  "📏 Mesurabilité des objectifs"),
+            ("jalons",        "📅 Faisabilité du premier jalon"),
+            ("competences",   "🧠 Adéquation des compétences"),
+            ("precedents",    "📚 Précédents comparables"),
+        ]
+        for key, label in criteres:
+            crit = d.get(key, {})
+            if isinstance(crit, dict):
+                s = crit.get("score", 0)
+                comment = crit.get("commentaire", "")
+                reco = crit.get("recommandation", "")
+                se = score_emoji(s, max_s=25)
+                with st.container():
+                    c1, c2 = st.columns([1, 4])
+                    with c1:
+                        st.metric(label, f"{se} {s}/25")
+                    with c2:
+                        st.markdown(comment)
+                        if reco:
+                            st.info(f"💡 {reco}")
+                st.divider()
+
+        # Analyse risques
+        if d.get("analyse_risques"):
+            st.subheader("⚠️ Analyse des risques")
+            st.warning(d["analyse_risques"])
+
+        # Recadrage
+        recadrage = d.get("recadrage_suggere")
+        if recadrage and verdict != "Cohérent":
+            st.subheader("🔄 Recadrage suggéré par Claude")
+            st.markdown(f"> {recadrage}")
+            if st.button("↩️ Adopter ce recadrage (retour Phase 2)"):
+                st.session_state.selected_sub_problem = recadrage
+                go_phase(1)
+
+        st.button("✅ Valider et passer à la Formulation Finale →", type="primary", on_click=next_phase)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# PHASE 4 — FORMULATION FINALE & EXPORT
+# ════════════════════════════════════════════════════════════════════════════════
+elif st.session_state.phase == 4:
+    phase_header("5", "Formulation Finale", "Votre 'bon' sous-problème formulé, documenté et prêt à l'action.")
+
+    score = st.session_state.coherence_score or 0
+    emoji = score_emoji(score)
+
+    _, mid, _ = st.columns([1, 2, 1])
+    with mid:
+        st.metric(f"{emoji} Score de cohérence final", f"{score}/100",
+                  delta=st.session_state.coherence_details.get("verdict", ""))
+
+    st.divider()
+
+    if st.button("✨ Générer la formulation finale", type="primary",
+                 disabled=not st.session_state.api_key):
+        r = st.session_state.resources
+        c = st.session_state.constraints
+
+        prompt = f"""Synthétise le travail réalisé pour formuler le "bon" sous-problème final.
+
+PROBLÈME GÉNÉRAL : {st.session_state.reformulation}
+SOUS-PROBLÈME RETENU : {st.session_state.selected_sub_problem}
+SCORE DE COHÉRENCE : {score}/100 — {st.session_state.coherence_details.get("verdict", "")}
+
+RESSOURCES : Budget {r.get('budget', 0):,}€ | {r.get('etp', 0)} ETP | {c.get('duree_mois', 0)} mois
+OBJECTIF PRINCIPAL : {c.get('objectif_principal', 'Non précisé')}
+
+Génère en JSON valide (aucun markdown) :
+- "hmw" : Formulation "Comment pourrions-nous..." (HMW) en 1-2 phrases. Intègre : qui agit, sur quel levier, pour quelle cible, vers quel objectif chiffré, dans quel délai
+- "formulation_complete" : Brief de problème en 3-4 phrases utilisable comme document de référence de projet
+- "indicateurs_succes" : Liste de 4-5 KPIs mesurables avec unités et valeurs cibles si possible
+- "prochaines_etapes" : Les 3 premières actions concrètes à mener dans les 30 prochains jours (très opérationnel)
+- "risques_principaux" : Les 3 principaux risques à surveiller avec une action de mitigation pour chacun
+- "questions_restantes" : 2-3 questions importantes qui devront être résolues en cours de projet
+"""
+        with st.spinner("Formulation en cours…"):
+            raw = claude(prompt, max_tokens=2500)
+        data = parse_json(raw)
+        if data:
+            st.session_state.hmw = data.get("hmw", "")
+            st.session_state.final_data = data
+
+    if st.session_state.hmw:
+        fd = st.session_state.final_data
+
+        # HMW box
+        st.markdown(f"""
+<div class="hmw-box">
+  <p style="color:#a8d8ea; margin:0 0 8px 0; font-size:0.9rem; text-transform:uppercase; letter-spacing:1px">
+    Comment pourrions-nous…
+  </p>
+  <h3>{st.session_state.hmw}</h3>
+</div>
+""", unsafe_allow_html=True)
+
+        st.markdown(f"**Formulation complète :** {fd.get('formulation_complete', '')}")
+
+        st.divider()
+
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.subheader("📏 Indicateurs de succès (KPIs)")
+            for kpi in fd.get("indicateurs_succes", []):
+                st.markdown(f"• {kpi}")
+
+            st.subheader("⚡ 3 premières actions (J+30)")
+            for i, action in enumerate(fd.get("prochaines_etapes", []), 1):
+                st.markdown(f"**{i}.** {action}")
+
+        with col2:
+            st.subheader("⚠️ Risques & mitigations")
+            risques = fd.get("risques_principaux", [])
+            for risk in risques:
+                if isinstance(risk, dict):
+                    st.warning(f"**{risk.get('risque', risk)}**")
+                    if risk.get("mitigation"):
+                        st.caption(f"💡 {risk['mitigation']}")
+                else:
+                    st.warning(f"• {risk}")
+
+            if fd.get("questions_restantes"):
+                st.subheader("❓ Questions à résoudre en cours de route")
+                for q in fd.get("questions_restantes", []):
+                    st.info(f"• {q}")
+
+        st.divider()
+
+        # ── EXPORT ──────────────────────────────────────────────────
+        st.subheader("📥 Exporter votre fiche")
+
+        col_a, col_b = st.columns(2)
+
+        # Export DOCX
+        with col_a:
+            if st.button("📄 Générer la fiche Word (.docx)", use_container_width=True, type="primary"):
+                try:
+                    from docx import Document as Doc
+                    from docx.shared import Pt, RGBColor
+                    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+                    r = st.session_state.resources
+                    c = st.session_state.constraints
+                    d = st.session_state.coherence_details
+
+                    document = Doc()
+
+                    # Styles de base
+                    style = document.styles["Normal"]
+                    style.font.name = "Calibri"
+                    style.font.size = Pt(11)
+
+                    # Titre
+                    title_p = document.add_heading("Fiche de Problème Stratégique", 0)
+                    title_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    sub_p = document.add_paragraph(
+                        f"Générée le {datetime.now().strftime('%d/%m/%Y à %H:%M')}"
+                    )
+                    sub_p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+                    document.add_paragraph("")
+
+                    # 1. HMW
+                    document.add_heading("1. Formulation « Comment Pourrions-Nous »", level=1)
+                    p = document.add_paragraph(st.session_state.hmw)
+                    p.runs[0].bold = True
+
+                    # 2. Formulation complète
+                    document.add_heading("2. Formulation Complète du Sous-Problème", level=1)
+                    document.add_paragraph(fd.get("formulation_complete", ""))
+
+                    # 3. Problème général
+                    document.add_heading("3. Problème Général d'origine", level=1)
+                    document.add_paragraph(st.session_state.reformulation)
+
+                    # 4. Score de cohérence
+                    document.add_heading("4. Score de Cohérence", level=1)
+                    score_v = st.session_state.coherence_score
+                    verdict_v = d.get("verdict", "")
+                    document.add_paragraph(f"Score global : {score_v}/100  —  Verdict : {verdict_v}")
+
+                    for key, label in [
+                        ("mesurabilite", "Mesurabilité"),
+                        ("jalons", "Faisabilité jalons"),
+                        ("competences", "Compétences"),
+                        ("precedents", "Précédents"),
+                    ]:
+                        crit = d.get(key, {})
+                        if isinstance(crit, dict):
+                            document.add_paragraph(
+                                f"  • {label} : {crit.get('score', 0)}/25 — {crit.get('commentaire', '')}"
+                            )
+
+                    # 5. Ressources
+                    document.add_heading("5. Ressources & Contraintes", level=1)
+                    table = document.add_table(rows=7, cols=2)
+                    table.style = "Table Grid"
+                    rows_data = [
+                        ("Budget total", f"{r.get('budget', 0):,.0f} €"),
+                        ("Masse salariale / RH", f"{r.get('budget_rh', 0):,.0f} €"),
+                        ("Prestations externes", f"{r.get('budget_prestation', 0):,.0f} €"),
+                        ("ETP dédiés", str(r.get("etp", 0))),
+                        ("Durée totale", f"{c.get('duree_mois', 0)} mois"),
+                        ("Premier jalon", f"{c.get('jalon_mois', 0)} mois"),
+                        ("Partenaires obligatoires", c.get("partenaires_imposes", "Aucun")),
+                    ]
+                    for i, (k, v) in enumerate(rows_data):
+                        table.rows[i].cells[0].text = k
+                        table.rows[i].cells[1].text = v
+
+                    # 6. Objectif
+                    document.add_heading("6. Objectif Principal", level=1)
+                    document.add_paragraph(c.get("objectif_principal", "Non précisé"))
+                    if c.get("objectif_secondaire"):
+                        document.add_heading("Objectifs secondaires", level=2)
+                        document.add_paragraph(c.get("objectif_secondaire"))
+
+                    # 7. KPIs
+                    document.add_heading("7. Indicateurs de Succès (KPIs)", level=1)
+                    for kpi in fd.get("indicateurs_succes", []):
+                        document.add_paragraph(f"• {kpi}")
+
+                    # 8. Actions J+30
+                    document.add_heading("8. Prochaines Étapes (J+30)", level=1)
+                    for i, action in enumerate(fd.get("prochaines_etapes", []), 1):
+                        document.add_paragraph(f"{i}. {action}")
+
+                    # 9. Risques
+                    document.add_heading("9. Risques Principaux", level=1)
+                    for risk in fd.get("risques_principaux", []):
+                        if isinstance(risk, dict):
+                            document.add_paragraph(
+                                f"• {risk.get('risque', '')} → {risk.get('mitigation', '')}"
+                            )
+                        else:
+                            document.add_paragraph(f"• {risk}")
+
+                    # 10. Questions restantes
+                    if fd.get("questions_restantes"):
+                        document.add_heading("10. Questions à Résoudre en Cours de Projet", level=1)
+                        for q in fd.get("questions_restantes", []):
+                            document.add_paragraph(f"• {q}")
+
+                    buf = io.BytesIO()
+                    document.save(buf)
+                    buf.seek(0)
+
+                    st.download_button(
+                        label="⬇️ Télécharger la fiche Word",
+                        data=buf.getvalue(),
+                        file_name=f"fiche_sous_probleme_{datetime.now().strftime('%Y%m%d_%H%M')}.docx",
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                        use_container_width=True,
+                    )
+
+                except ImportError:
+                    st.error("python-docx non installé. Lancez : `pip install python-docx`")
+                except Exception as e:
+                    st.error(f"Erreur génération DOCX : {e}")
+
+        # Export JSON
+        with col_b:
+            export = {
+                "meta": {"date": datetime.now().isoformat(), "version": "1.0"},
+                "probleme_general": st.session_state.reformulation,
+                "sous_probleme_retenu": st.session_state.selected_sub_problem,
+                "formulation_hmw": st.session_state.hmw,
+                "formulation_complete": fd.get("formulation_complete", ""),
+                "coherence": {
+                    "score": st.session_state.coherence_score,
+                    "verdict": st.session_state.coherence_details.get("verdict", ""),
+                    "detail": {
+                        k: st.session_state.coherence_details.get(k, {})
+                        for k in ("mesurabilite", "jalons", "competences", "precedents")
+                    },
+                },
+                "ressources": st.session_state.resources,
+                "contraintes": st.session_state.constraints,
+                "indicateurs_succes": fd.get("indicateurs_succes", []),
+                "prochaines_etapes": fd.get("prochaines_etapes", []),
+                "risques": fd.get("risques_principaux", []),
+                "questions_restantes": fd.get("questions_restantes", []),
+            }
+            st.download_button(
+                label="⬇️ Exporter en JSON",
+                data=json.dumps(export, ensure_ascii=False, indent=2),
+                file_name=f"sous_probleme_{datetime.now().strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                use_container_width=True,
+            )
+
+        st.divider()
+        st.success("""
+✅ **Félicitations !** Vous avez formulé votre "bon" sous-problème.
+
+Cette fiche est votre référence de projet. Si le score de cohérence est sous 70, revoyez
+le périmètre avant de vous lancer. Un bon problème bien formulé, c'est déjà 50% du travail.
+        """)
